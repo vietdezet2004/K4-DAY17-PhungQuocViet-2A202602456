@@ -182,3 +182,85 @@ Nếu các bạn là giảng viên hoặc reviewer:
 - `Rubric.md`: tiêu chí chấm điểm và bonus
 
 Track này được thiết kế để các bạn không chỉ “dùng agent”, mà còn bắt đầu nghĩ như một người thiết kế **memory system** cho agent production.
+
+---
+
+## Phân tích kết quả benchmark (Bonus – Phase 8)
+
+### 1. Vì sao Advanced có recall tốt hơn Baseline?
+
+Baseline chỉ giữ lịch sử trong cùng `thread_id`. Khi sang thread mới, toàn bộ context bị xóa — agent không còn biết tên người dùng, nghề nghiệp hay sở thích. Đây là thiết kế cố ý: baseline là mốc so sánh, không phải mục tiêu.
+
+Advanced dùng `User.md` làm bộ nhớ bền vững. Mỗi lượt hội thoại, `extract_profile_updates()` trích các fact ổn định (tên, nơi ở, nghề nghiệp, đồ uống, ...) rồi `upsert_fact()` ghi vào file. Thread mới đọc lại `User.md` → recall 1.000 dù đây là lần đầu gặp thread_id đó.
+
+**Kết quả đo được:**
+
+| Benchmark | Baseline recall | Advanced recall |
+|---|---|---|
+| Standard (10 hội thoại) | 0.071 | **1.000** |
+| Stress (16 turns dài) | 0.000 | **1.000** |
+
+### 2. Vì sao Advanced có thể tốn token hơn ở hội thoại ngắn?
+
+Mỗi lượt của Advanced phải mang theo `User.md` + `summary` + recent messages. Ở hội thoại 1–3 turns, `User.md` chưa compact được gì nên tổng prompt context thực ra lớn hơn baseline vì phải load thêm file profile overhead.
+
+Với Standard Benchmark (hội thoại ~10 turns mỗi conv):
+- Baseline: **21,222** prompt tokens
+- Advanced: **26,149** prompt tokens (tốn hơn ~23%)
+
+Đây là **trade-off có chủ đích**: chi thêm prompt token để đổi lấy cross-session recall từ 0.071 lên 1.000.
+
+### 3. Vì sao compact giúp Advanced có lợi thế ở hội thoại dài?
+
+`CompactMemoryManager` nén các message cũ thành summary khi tổng token vượt `compact_threshold_tokens`. Chỉ `keep_messages` message gần nhất được giữ nguyên. Kết quả: prompt context không tăng tuyến tính như baseline.
+
+**Stress test (16 turns, nội dung rất dài):**
+
+| | Baseline | Advanced |
+|---|---|---|
+| Prompt tokens | 24,229 | **13,060** |
+| Tiết kiệm | — | **−46.1%** |
+| Compactions | 0 | **18** |
+
+Baseline phải kéo toàn bộ 16 turns vào mỗi lượt. Advanced nén dần, chỉ giữ 2 turns gần nhất + summary nén của phần cũ → prompt bounded.
+
+### 4. Rủi ro khi `User.md` phình to hoặc lưu sai fact
+
+**Rủi ro 1 – File phình to theo thời gian:**
+Mỗi `upsert_fact()` cập nhật in-place nhưng nếu có nhiều key mới liên tục, file tăng trưởng tuyến tính. Sau nhiều tháng dùng, `User.md` có thể chứa hàng trăm facts → overhead prompt mỗi lượt lớn dần. Giải pháp: định kỳ compact/prune các fact không được dùng gần đây (Memory decay – Bonus 8.3).
+
+**Rủi ro 2 – Lưu sai fact (false positive):**
+Regex có thể bắt nhầm context (ví dụ: "Hà Nội chỉ là nơi đi họp" → không phải nơi ở). Đã xử lý bằng noise guard và `_NOISE_LOCATION` pattern. Tuy nhiên, với các pattern phức tạp hơn vẫn có khả năng false positive.
+
+**Rủi ro 3 – Fact cũ không được cập nhật:**
+Nếu người dùng đổi nghề nhưng không dùng từ ngữ đủ rõ ràng ("giờ làm X", "chuyển sang X"), `extract_profile_updates()` có thể bỏ sót correction. Confidence threshold (Bonus 8.1) giảm false positive nhưng có thể tăng false negative.
+
+### 5. Bonus – Confidence Threshold (Task 8.1)
+
+`confidence_score()` trong `memory_store.py` tính điểm tin cậy cho mỗi fact trước khi lưu:
+
+- **1.0** – câu khai báo trực tiếp ("Mình tên là X")
+- **0.4** – câu có hedge words ("có lẽ mình ở Huế") → bị lọc (< 0.5)
+- **0.95** – câu đính chính ("mình đính chính: giờ là MLOps engineer") → luôn được lưu
+- **0.2** – câu hỏi thuần túy ("Bạn có nhớ mình tên gì?") → bị lọc
+
+Ví dụ cases được lọc nhờ confidence threshold:
+```
+"Có lẽ mình đang ở Huế"       → score=0.4  → KHÔNG lưu location
+"Chắc là làm backend engineer" → score=0.4  → KHÔNG lưu profession
+"Mình đính chính: ở Đà Nẵng"  → score=0.95 → LƯU location (correction)
+```
+
+### 6. Bonus – Conflict Handling (Task 8.2)
+
+`UserProfileStore.upsert_fact()` thực hiện **update-in-place**: tìm dòng `- key: old_value` bằng regex và thay bằng `- key: new_value`. Fact cũ bị xóa, không giữ song song. Điều này đảm bảo:
+
+- `User.md` luôn chứa **giá trị mới nhất** cho mỗi key
+- Correction "Đà Nẵng → Huế → Đà Nẵng" xử lý đúng qua từng bước
+- Không có hiện tượng "lưu cả fact cũ lẫn fact mới" gây confusion cho agent
+
+```
+Conv-02: location = Đà Nẵng   →  User.md: - location: Đà Nẵng
+Conv-03: correction → Huế     →  User.md: - location: Huế      (cũ bị overwrite)
+Stress:  correction → Đà Nẵng →  User.md: - location: Đà Nẵng  (cũ bị overwrite)
+```
